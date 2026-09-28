@@ -1,0 +1,68 @@
+{
+    "name": "omx_ros2",
+    "image": "osrf/ros:humble-desktop",
+    "remoteUser": "root",
+    "workspaceFolder": "/workspaces/omx_ros2",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/omx_ros2,type=bind,consistency=cached",
+    "shutdownAction": "stopContainer",
+    "containerEnv": {
+        "ROS_DISTRO": "humble",
+        "OMX_LOG_DIR": "/mnt/omx_logs",
+        "NVIDIA_NIM_API_KEY": "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",
+        "CODEX_OVERRIDE_PROVIDER": "openai-custom",
+        "CODEX_OVERRIDE_BASE_URL": "https://nvidia.com",
+        "CODEX_OVERRIDE_MODEL": "z-ai/glm-5.1",
+        "CODEX_DISABLE_CLOUD_SYNC": "true",
+        "CODEX_ENTERPRISE_MODE": "self_hosted",
+        "CODEX_BYPASS_BILLING": "true"
+    },
+    "postCreateCommand": "chmod +x /workspaces/omx_ros2/.devcontainer/setup.sh && /workspaces/omx_ros2/.devcontainer/setup.sh",
+    
+    "postStartCommand": "/workspaces/omx_ros2/CLIProxyAPI/start_proxy_stack.sh",
+    "runArgs": [
+        "--privileged",
+        "--publish=5005:5005/udp",
+        "--hostname=omx-ros2",
+        "--volume=/dev:/dev",
+        "--volume=/dev/serial:/dev/serial",
+        "--memory=20g",
+        "--memory-swap=28g",
+        "--cpus=6",
+        "--shm-size=8g",
+        "--volume=/mnt/wslg:/mnt/wslg",
+        "--volume=/mnt/d/OMX_Experiment_Data:/mnt/omx_logs",
+        "--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+        "--env=DISPLAY",
+        "--env=WAYLAND_DISPLAY",
+        "--env=XDG_RUNTIME_DIR",
+        "--env=PULSE_SERVER"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-iot.vscode-ros",
+                "ms-vscode.cpptools",
+                "ms-python.python",
+                "punal100.antigravity-copilot",
+                "SmallMain.vscode-unify-chat-provider",
+                "ms-azuretools.vscode-docker",
+                "ltmoerdani.opencode-copilot-chat",
+                "openai.chatgpt",
+                "yuanzhixiang.claude-code-yolo",
+                "openai.codex-edge",
+                "HidenobuNagai.nvidia-nim-provider"
+            ],
+            "settings": {
+                "codex.disableCloudSync": true,
+                "codex.overrideModel": "gpt-5.4-mini",
+                "codex.customBaseUrl": "https://integrate.api.nvidia.com/v1"
+            }
+        }
+    },
+    "remoteEnv": {
+        "DISPLAY": "${localEnv:DISPLAY}",
+        "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY}",
+        "XDG_RUNTIME_DIR": "${localEnv:XDG_RUNTIME_DIR}",
+        "PULSE_SERVER": "${localEnv:PULSE_SERVER}"
+    }
+}
