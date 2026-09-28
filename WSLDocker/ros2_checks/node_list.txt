@@ -1,0 +1,15 @@
+/camera
+/gazebo
+/gazebo/gazebo_ros_state
+/robot1/controller_manager
+/robot1/gazebo_ros2_control_robot1
+/robot1/gazebo_ros2_control_robot2
+/robot1/gripper_controller
+/robot1/joint_state_broadcaster
+/robot1/robot1_variable_stiffness
+/robot1/robot_state_publisher
+/robot2/controller_manager
+/robot2/gripper_controller
+/robot2/joint_state_broadcaster
+/robot2/robot2_variable_stiffness
+/robot2/robot_state_publisher

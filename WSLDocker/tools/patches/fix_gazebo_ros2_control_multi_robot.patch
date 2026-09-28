@@ -1,0 +1,25 @@
+--- a/src/gazebo_ros2_control_plugin.cpp
++++ b/src/gazebo_ros2_control_plugin.cpp
+@@ -227,16 +227,10 @@
+   if (sdf->HasElement("ros")) {
+     sdf = sdf->GetElement("ros");
+ 
+-    // Set namespace if tag is present
+-    if (sdf->HasElement("namespace")) {
+-      std::string ns = sdf->GetElement("namespace")->Get<std::string>();
+-      // prevent exception: namespace must be absolute, it must lead with a '/'
+-      if (ns.empty() || ns[0] != '/') {
+-        ns = '/' + ns;
+-      }
+-      std::string ns_arg = std::string("__ns:=") + ns;
+-      arguments.push_back(RCL_REMAP_FLAG);
+-      arguments.push_back(ns_arg);
+-    }
++    // MULTI-ROBOT FIX: Do NOT add __ns to global rcl arguments.
++    // The namespace is already correctly handled by gazebo_ros::Node::Get(sdf)
++    // and passed explicitly to ControllerManager. Adding __ns here poisons the
++    // global rcl_context, causing subsequent plugin instances in the same
++    // gzserver process to inherit the first plugin's namespace.
+ 
+     // Get list of remapping rules from SDF
+     if (sdf->HasElement("remapping")) {

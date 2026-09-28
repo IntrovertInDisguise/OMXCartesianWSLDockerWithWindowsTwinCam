@@ -1,0 +1,40 @@
+/robot1/robot1_variable_stiffness
+  Subscribers:
+    /clock: rosgraph_msgs/msg/Clock
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /robot1/robot1_variable_stiffness/set_k_lateral: std_msgs/msg/Float64
+    /robot1/robot1_variable_stiffness/stiffness_profile_update: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/waypoint_command: geometry_msgs/msg/PoseStamped
+    /robot2/robot2_variable_stiffness/sync_phase_ready: std_msgs/msg/Int32
+  Publishers:
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /robot1/robot1_variable_stiffness/cartesian_pose_actual: geometry_msgs/msg/Pose
+    /robot1/robot1_variable_stiffness/cartesian_pose_desired: geometry_msgs/msg/Pose
+    /robot1/robot1_variable_stiffness/contact_valid: std_msgs/msg/Bool
+    /robot1/robot1_variable_stiffness/contact_wrench: geometry_msgs/msg/WrenchStamped
+    /robot1/robot1_variable_stiffness/deviated_waypoint: sensor_msgs/msg/JointState
+    /robot1/robot1_variable_stiffness/end_effector_orientation: geometry_msgs/msg/Vector3
+    /robot1/robot1_variable_stiffness/end_effector_position: geometry_msgs/msg/Point
+    /robot1/robot1_variable_stiffness/end_effector_velocities: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/jacobian_values: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/joint_velocities: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/manipulability_metrics: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/stiffness_state: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/sync_phase_ready: std_msgs/msg/Int32
+    /robot1/robot1_variable_stiffness/torque_values: std_msgs/msg/Float64MultiArray
+    /robot1/robot1_variable_stiffness/transition_event: lifecycle_msgs/msg/TransitionEvent
+    /robot1/robot1_variable_stiffness/waypoint_active: std_msgs/msg/Bool
+    /rosout: rcl_interfaces/msg/Log
+  Service Servers:
+    /robot1/robot1_variable_stiffness/describe_parameters: rcl_interfaces/srv/DescribeParameters
+    /robot1/robot1_variable_stiffness/get_parameter_types: rcl_interfaces/srv/GetParameterTypes
+    /robot1/robot1_variable_stiffness/get_parameters: rcl_interfaces/srv/GetParameters
+    /robot1/robot1_variable_stiffness/list_parameters: rcl_interfaces/srv/ListParameters
+    /robot1/robot1_variable_stiffness/set_parameters: rcl_interfaces/srv/SetParameters
+    /robot1/robot1_variable_stiffness/set_parameters_atomically: rcl_interfaces/srv/SetParametersAtomically
+  Service Clients:
+
+  Action Servers:
+
+  Action Clients:
+
