@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Contact-armed synchronization bridge for OMX -> Windows RealSense recorder.
+
+Key rule:
+  Dynamixel/U2D2 communication warnings BEFORE physical contact do not abort
+  camera recording.  The post-contact fault monitor is armed only when the
+  harness logs PHYSICAL_CONTACT_EVENT=contact_established.
+
+After contact, a persistent/high-confidence bus failure generates ABORT, then
+STOP after a configurable post-roll so the partial trial remains usable.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import signal
+import socket
+import sys
+import time
+from pathlib import Path
+from typing import Optional, TextIO
+
+STOP_REQUESTED = False
+ROS_LOG_TS_RE = re.compile(r"\[(\d{9,}(?:\.\d+)?)\]")
+DXL_DURATION_RE = re.compile(r"Dynamixel Read Fail \(Duration:\s*([0-9.]+)ms/")
+CONTACT_ROS_RE = re.compile(r"contact_ros_time_s=([0-9.]+)")
+CONTACT_FX_RE = re.compile(r"Fx_abs_N=([0-9.]+)")
+
+START_TOKEN = "WAIT_AT_START done"
+START_TOKEN_2 = "MOVE_FORWARD"
+END_TOKEN = "MOVE_FORWARD done"
+END_TOKEN_2 = "WAIT_AT_END"
+CONTACT_TOKEN = "PHYSICAL_CONTACT_EVENT=contact_established"
+
+
+def _sig(_signum, _frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+
+
+signal.signal(signal.SIGINT, _sig)
+signal.signal(signal.SIGTERM, _sig)
+
+
+def args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--log-file", type=Path, required=True)
+    p.add_argument("--harness-log", type=Path, required=True)
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--host", default="host.docker.internal")
+    p.add_argument("--port", type=int, default=5006)
+    p.add_argument("--bringup-pid", type=int, default=None)
+    p.add_argument("--sync-period-s", type=float, default=0.5)
+    p.add_argument("--normal-post-roll-s", type=float, default=5.0)
+    p.add_argument("--abort-post-roll-s", type=float, default=5.0)
+    p.add_argument("--dxl-fail-duration-ms", type=float, default=150.0)
+    p.add_argument("--handshake-timeout-s", type=float, default=3.0)
+    p.add_argument("--event-repeats", type=int, default=3)
+    p.add_argument("--event-log", type=Path, default=None,
+                   help="Local structured CSV of emitted sync/experiment events.")
+    p.add_argument("--no-require-recorder", action="store_true")
+    return p.parse_args()
+
+
+def stamps() -> str:
+    return f"linux_wall_time_s={time.time():.9f} linux_monotonic_ns={time.monotonic_ns()}"
+
+
+def send(sock: socket.socket, dest, msg: str, repeats: int = 1) -> None:
+    data = msg.encode("utf-8")
+    for i in range(max(1, repeats)):
+        sock.sendto(data, dest)
+        if i + 1 < repeats:
+            time.sleep(0.005)
+
+
+def log_ros_time(line: str) -> Optional[float]:
+    m = ROS_LOG_TS_RE.search(line)
+    return float(m.group(1)) if m else None
+
+
+def open_if_exists(path: Path, handle: Optional[TextIO]) -> Optional[TextIO]:
+    if handle is None and path.exists():
+        return path.open("r", encoding="utf-8", errors="replace")
+    return handle
+
+
+def pid_alive(pid: Optional[int]) -> bool:
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def main() -> int:
+    a = args()
+    if a.sync_period_s <= 0 or a.port <= 0:
+        return 2
+
+    dest = (socket.gethostbyname(a.host), a.port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+
+    # Handshake. This only checks that Windows is recording/listening.
+    sock.settimeout(0.25)
+    deadline = time.monotonic() + a.handshake_timeout_s
+    handshake_ok = False
+    attempt = 0
+    while time.monotonic() < deadline and not STOP_REQUESTED:
+        attempt += 1
+        send(sock, dest, f"PING {a.run_id} attempt={attempt} {stamps()}")
+        try:
+            data, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if data.decode("utf-8", errors="replace").strip().startswith("PONG"):
+            handshake_ok = True
+            break
+    sock.settimeout(None)
+    if not handshake_ok and not a.no_require_recorder:
+        print("[RGB-SYNC] ERROR: Windows recorder did not answer PING", file=sys.stderr)
+        return 4
+
+    # Bringup log should exist quickly; harness log is created later.
+    limit = time.monotonic() + 10.0
+    while not a.log_file.exists() and time.monotonic() < limit and not STOP_REQUESTED:
+        time.sleep(0.02)
+    if not a.log_file.exists():
+        print(f"[RGB-SYNC] ERROR: no bringup log {a.log_file}", file=sys.stderr)
+        return 5
+
+    bringup = a.log_file.open("r", encoding="utf-8", errors="replace")
+    harness: Optional[TextIO] = None
+
+    seq = 0
+    next_sync = time.monotonic()
+    started = False
+    contact_armed = False
+    contact_ros_time_s: Optional[float] = None
+    aborted = False
+    ended = False
+    precontact_dxl_lines = 0
+    # Timestamped bus warnings seen before the contact marker are held until
+    # contact time is known.  This prevents cross-file buffering from turning
+    # a genuine post-contact fault into "precontact", or vice versa.
+    pending_comm_lines = []
+    stop_deadline: Optional[float] = None
+    stop_reason = "normal_post_roll"
+
+    event_handle = None
+    event_writer = None
+    if a.event_log is not None:
+        a.event_log.parent.mkdir(parents=True, exist_ok=True)
+        event_handle = a.event_log.open("w", newline="", encoding="utf-8", buffering=1)
+        event_writer = csv.writer(event_handle)
+        event_writer.writerow([
+            "event", "run_id", "linux_wall_time_s", "linux_monotonic_ns", "payload"
+        ])
+
+    def event(name: str, extra: str = "", repeats: Optional[int] = None) -> None:
+        wall_s = time.time()
+        mono_ns = time.monotonic_ns()
+        msg = f"{name} {a.run_id}"
+        if extra:
+            msg += " " + extra
+        msg += f" linux_wall_time_s={wall_s:.9f} linux_monotonic_ns={mono_ns}"
+        send(sock, dest, msg, a.event_repeats if repeats is None else repeats)
+        if event_writer is not None:
+            event_writer.writerow([name, a.run_id, f"{wall_s:.9f}", mono_ns, msg])
+            event_handle.flush()
+        print(f"[RGB-SYNC] {msg}", flush=True)
+
+    def abort(reason: str, detail: str = "") -> None:
+        nonlocal aborted, stop_deadline, stop_reason
+        if aborted:
+            return
+        aborted = True
+        detail = detail.strip().replace(" ", "_")[:220]
+        extra = f"reason={reason}" + (f" detail={detail}" if detail else "")
+        event("ABORT", extra)
+        stop_reason = "aborted_after_contact"
+        stop_deadline = time.monotonic() + a.abort_post_roll_s
+
+    def handle_postcontact_comm(line: str) -> None:
+        if aborted:
+            return
+        if "[STALE] Position unchanged" in line:
+            abort("stale_joint_feedback", line)
+        elif "Dynamixel Read Fail : REBOOTING" in line:
+            abort("dynamixel_rebooting", line)
+        else:
+            m = DXL_DURATION_RE.search(line)
+            if m and float(m.group(1)) >= a.dxl_fail_duration_ms:
+                abort("persistent_dynamixel_read_failure", f"duration_ms={m.group(1)}")
+
+    try:
+        while not STOP_REQUESTED:
+            now = time.monotonic()
+            if now >= next_sync:
+                seq += 1
+                event("SYNC", f"seq={seq}", repeats=1)
+                next_sync = now + a.sync_period_s
+
+            # Drain bringup first.  This prevents an old pre-contact bus warning
+            # that was buffered in the bringup log from being reclassified merely
+            # because the harness contact marker was read first in this iteration.
+            had_line = False
+            while True:
+                line = bringup.readline()
+                if not line:
+                    break
+                had_line = True
+
+                if not started and START_TOKEN in line and START_TOKEN_2 in line:
+                    started = True
+                    t = log_ros_time(line)
+                    event("MOVE_FORWARD_START", f"ros_log_time_s={t:.9f}" if t is not None else "ros_log_time_s=nan")
+
+                comm_line = "Dynamixel Read Fail" in line or "[STALE] Position unchanged" in line
+                if comm_line:
+                    line_ros_t = log_ros_time(line)
+                    if not contact_armed:
+                        if line_ros_t is None:
+                            # With no comparable timestamp there is no evidence
+                            # that this preliminary line occurred after contact.
+                            precontact_dxl_lines += 1
+                        else:
+                            pending_comm_lines.append((line_ros_t, line))
+                    elif (
+                        contact_ros_time_s is not None
+                        and line_ros_t is not None
+                        and line_ros_t < contact_ros_time_s
+                    ):
+                        precontact_dxl_lines += 1
+                    else:
+                        handle_postcontact_comm(line)
+
+                if not ended and END_TOKEN in line and END_TOKEN_2 in line:
+                    ended = True
+                    t = log_ros_time(line)
+                    event("MOVE_FORWARD_END", f"ros_log_time_s={t:.9f}" if t is not None else "ros_log_time_s=nan")
+                    if not aborted:
+                        stop_reason = "normal_post_roll"
+                        stop_deadline = time.monotonic() + a.normal_post_roll_s
+
+            # Contact is a separate harness-side physical-force event.  Read it
+            # after draining bringup, and retain its ROS timestamp for rejecting
+            # any delayed/buffered pre-contact communication lines on later loops.
+            harness = open_if_exists(a.harness_log, harness)
+            if harness is not None:
+                while True:
+                    line = harness.readline()
+                    if not line:
+                        break
+                    if not contact_armed and CONTACT_TOKEN in line:
+                        tr = CONTACT_ROS_RE.search(line)
+                        fx = CONTACT_FX_RE.search(line)
+                        if tr:
+                            try:
+                                contact_ros_time_s = float(tr.group(1))
+                            except ValueError:
+                                contact_ros_time_s = None
+                        contact_armed = True
+                        # First classify timestamped communication lines that
+                        # arrived before this contact marker was consumed.
+                        postcontact_pending = []
+                        still_precontact = 0
+                        for pending_t, pending_line in pending_comm_lines:
+                            if contact_ros_time_s is not None and pending_t >= contact_ros_time_s:
+                                postcontact_pending.append(pending_line)
+                            else:
+                                still_precontact += 1
+                        precontact_dxl_lines += still_precontact
+                        pending_comm_lines.clear()
+
+                        event(
+                            "CONTACT",
+                            "contact_ros_time_s=%s Fx_abs_N=%s ignored_precontact_dxl_lines=%d"
+                            % (
+                                tr.group(1) if tr else "nan",
+                                fx.group(1) if fx else "nan",
+                                precontact_dxl_lines,
+                            ),
+                        )
+                        print("[RGB-SYNC] POST-CONTACT fault monitor ARMED", flush=True)
+                        for pending_line in postcontact_pending:
+                            handle_postcontact_comm(pending_line)
+
+            if contact_armed and not aborted and not pid_alive(a.bringup_pid):
+                abort("ros2_control_process_exited")
+
+            if stop_deadline is not None and now >= stop_deadline:
+                event("STOP", f"reason={stop_reason}")
+                return 0
+
+            if not had_line:
+                time.sleep(0.01)
+
+        # External runner interruption. This is a STOP, not an ABORT if contact
+        # was never established; preliminary communication trouble is therefore
+        # not misclassified as a contact-phase failure.
+        reason = "bridge_terminated_after_contact" if contact_armed else "precontact_run_terminated"
+        event("STOP", f"reason={reason}")
+        return 130
+    finally:
+        bringup.close()
+        if harness is not None:
+            harness.close()
+        if event_handle is not None:
+            event_handle.flush()
+            event_handle.close()
+        sock.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

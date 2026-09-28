@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""OpenMANIPULATOR-X current telemetry without controller C++ changes.
+
+Requires only one ros2_control description change: expose each motor's existing
+Dynamixel ``Goal Current`` register as an additional GPIO *state interface*.
+The repository's Dynamixel hardware plugin already inserts every GPIO state
+interface into its normal multi-Dynamixel read set, and Humble's
+joint_state_broadcaster publishes custom state interfaces in
+``DynamicJointState``.
+
+Signals kept separate:
+  1. torque_values                  -> pre-safety controller request [raw-like]
+  2. dynamic_joint_states Goal Current -> hardware Goal Current register readback [raw]
+  3. joint_states.effort            -> hardware Present Current feedback [raw]
+
+None is a direct torque sensor measurement.  A current-derived torque estimate
+is emitted only if explicit per-joint calibration coefficients are supplied.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import signal
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import rclpy
+from control_msgs.msg import DynamicJointState
+from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
+
+XM430_CURRENT_A_PER_RAW = 2.69e-3
+STOP_REQUESTED = False
+
+
+def _signal_handler(_signum, _frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+def _safe_float(x) -> float:
+    try:
+        y = float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+    return y if math.isfinite(y) else float("nan")
+
+
+def _parse_vector(text: Optional[str], n: int, name: str) -> Optional[List[float]]:
+    if text is None or text == "":
+        return None
+    vals = [float(x.strip()) for x in text.split(",") if x.strip()]
+    if len(vals) == 1:
+        vals *= n
+    if len(vals) != n:
+        raise ValueError(f"{name} requires 1 or {n} comma-separated values; got {len(vals)}")
+    return vals
+
+
+def _joint_stamp_s(msg: JointState) -> float:
+    st = msg.header.stamp
+    if st.sec == 0 and st.nanosec == 0:
+        return float("nan")
+    return float(st.sec) + float(st.nanosec) * 1e-9
+
+
+class Logger(Node):
+    def __init__(self, args: argparse.Namespace):
+        super().__init__("omx_motor_current_torque_logger")
+        self.args = args
+        self.joints = list(args.joints)
+        self.n = len(self.joints)
+        self.dxl_resources = list(args.dxl_resources)
+        if len(self.dxl_resources) != self.n:
+            raise ValueError("--dxl-resources must have the same length as --joints")
+        self.resource_to_i = {name: i for i, name in enumerate(self.dxl_resources)}
+        self.current_a_per_raw = float(args.current_a_per_raw)
+        self.torque_scale = float(args.torque_scale_raw_per_nm)
+        self.slopes = _parse_vector(args.torque_slope_nm_per_a, self.n, "--torque-slope-nm-per-a")
+        self.offsets = _parse_vector(args.torque_offset_nm, self.n, "--torque-offset-nm")
+        if self.slopes is not None and self.offsets is None:
+            self.offsets = [0.0] * self.n
+        if self.slopes is None and self.offsets is not None:
+            raise ValueError("--torque-offset-nm requires --torque-slope-nm-per-a")
+
+        ns = args.namespace.strip("/")
+        ctrl = f"/{ns}/{ns}_variable_stiffness"
+        self.js_topic = args.joint_states_topic or f"/{ns}/joint_states"
+        self.request_topic = args.request_topic or f"{ctrl}/torque_values"
+        self.dynamic_topic = args.dynamic_joint_states_topic or f"/{ns}/dynamic_joint_states"
+
+        self.latest_request = [float("nan")] * self.n
+        self.latest_goal_register = [float("nan")] * self.n
+        self.latest_request_ros_s = float("nan")
+        self.latest_goal_ros_s = float("nan")
+
+        self.counts = {"feedback": 0, "request": 0, "goal_register": 0}
+        self.first_mono: Dict[str, Optional[int]] = {k: None for k in self.counts}
+        self.last_mono: Dict[str, Optional[int]] = {k: None for k in self.counts}
+
+        self.output = Path(args.output)
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self.meta_path = self.output.with_suffix(".metadata.json")
+        self.csv_handle = self.output.open("w", newline="", encoding="utf-8", buffering=1024 * 1024)
+        self.writer = csv.writer(self.csv_handle)
+        self.rows_since_flush = 0
+
+        header = [
+            "record_type", "host_monotonic_ns", "host_wall_time_s", "rx_ros_time_s",
+            "message_time_s", "pre_safety_request_age_s", "goal_register_age_s",
+        ]
+        for j in self.joints:
+            header += [
+                f"{j}_position_rad",
+                f"{j}_velocity_rad_s",
+                f"{j}_present_current_raw",
+                f"{j}_present_current_A",
+                f"{j}_torque_est_Nm",
+                f"{j}_pre_safety_request_raw_latest",
+                f"{j}_pre_safety_request_A_latest",
+                f"{j}_request_model_equivalent_Nm_latest",
+                f"{j}_goal_current_register_raw_latest",
+                f"{j}_goal_current_register_A_latest",
+            ]
+        self.writer.writerow(header)
+
+        qos = QoSProfile(
+            depth=max(10, args.qos_depth),
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(JointState, self.js_topic, self._feedback_cb, qos)
+        self.create_subscription(Float64MultiArray, self.request_topic, self._request_cb, qos)
+        self.create_subscription(DynamicJointState, self.dynamic_topic, self._dynamic_cb, qos)
+
+        self.metadata = {
+            "created_wall_time_s": time.time(),
+            "namespace": ns,
+            "joint_states_topic": self.js_topic,
+            "pre_safety_request_topic": self.request_topic,
+            "dynamic_joint_states_topic": self.dynamic_topic,
+            "dynamixel_resources": self.dxl_resources,
+            "goal_current_source": "Dynamixel Goal Current register exposed as ros2_control GPIO state interface; no controller C++ patch",
+            "present_current_source": "joint_states.effort mapped from Dynamixel Present Current",
+            "current_A_per_raw": self.current_a_per_raw,
+            "torque_scale_raw_per_nm": self.torque_scale,
+            "torque_estimate_is_direct_sensor_measurement": False,
+            "torque_slope_nm_per_a": self.slopes,
+            "torque_offset_nm": self.offsets,
+            "warning": "Goal Current is command-register readback; Present Current is measured current. Neither is a direct torque-sensor measurement.",
+        }
+        self._write_metadata()
+        self.get_logger().info(f"Present Current: {self.js_topic}")
+        self.get_logger().info(f"Pre-safety request: {self.request_topic}")
+        self.get_logger().info(f"Goal Current register: {self.dynamic_topic} resources={self.dxl_resources}")
+        self.get_logger().info(f"CSV: {self.output}")
+
+    def _write_metadata(self):
+        self.meta_path.write_text(json.dumps(self.metadata, indent=2), encoding="utf-8")
+
+    def _base_times(self):
+        return time.monotonic_ns(), time.time(), self.get_clock().now().nanoseconds * 1e-9
+
+    def _mark(self, kind: str, mono_ns: int):
+        if self.first_mono[kind] is None:
+            self.first_mono[kind] = mono_ns
+        self.last_mono[kind] = mono_ns
+        self.counts[kind] += 1
+
+    def _age(self, now_ros: float, then_ros: float) -> float:
+        return now_ros - then_ros if math.isfinite(then_ros) else float("nan")
+
+    def _torque_estimate(self, i: int, current_a: float) -> float:
+        if self.slopes is None or not math.isfinite(current_a):
+            return float("nan")
+        mag = max(0.0, self.slopes[i] * abs(current_a) + self.offsets[i])
+        return math.copysign(mag, current_a) if current_a != 0 else 0.0
+
+    def _model_nm(self, raw: float) -> float:
+        if not math.isfinite(raw) or self.torque_scale == 0:
+            return float("nan")
+        return raw / self.torque_scale
+
+    def _append_joint_block(self, row: List[object], i: int, pos: float, vel: float, present_raw: float):
+        present_a = present_raw * self.current_a_per_raw if math.isfinite(present_raw) else float("nan")
+        req = self.latest_request[i]
+        req_a = req * self.current_a_per_raw if math.isfinite(req) else float("nan")
+        goal = self.latest_goal_register[i]
+        goal_a = goal * self.current_a_per_raw if math.isfinite(goal) else float("nan")
+        row += [
+            pos, vel, present_raw, present_a, self._torque_estimate(i, present_a),
+            req, req_a, self._model_nm(req), goal, goal_a,
+        ]
+
+    def _write_row(self, kind: str, mono_ns: int, wall_s: float, ros_s: float,
+                   message_time_s: float, positions=None, velocities=None, currents=None):
+        positions = positions or [float("nan")] * self.n
+        velocities = velocities or [float("nan")] * self.n
+        currents = currents or [float("nan")] * self.n
+        row: List[object] = [
+            kind, mono_ns, wall_s, ros_s, message_time_s,
+            self._age(ros_s, self.latest_request_ros_s),
+            self._age(ros_s, self.latest_goal_ros_s),
+        ]
+        for i in range(self.n):
+            self._append_joint_block(row, i, positions[i], velocities[i], currents[i])
+        self.writer.writerow(row)
+        self.rows_since_flush += 1
+        if self.rows_since_flush >= self.args.flush_every:
+            self.csv_handle.flush()
+            self.rows_since_flush = 0
+
+    def _request_cb(self, msg: Float64MultiArray):
+        mono, wall, ros = self._base_times()
+        vals = list(msg.data)
+        for i in range(self.n):
+            self.latest_request[i] = _safe_float(vals[i]) if i < len(vals) else float("nan")
+        self.latest_request_ros_s = ros
+        self._mark("request", mono)
+        # Dense CSV: request callback updates cache/rate only; feedback rows serialize it.
+
+    def _dynamic_cb(self, msg: DynamicJointState):
+        mono, wall, ros = self._base_times()
+        changed = False
+        # joint_names and interface_values are parallel arrays.
+        for resource, iv in zip(msg.joint_names, msg.interface_values):
+            i = self.resource_to_i.get(resource)
+            if i is None:
+                continue
+            for name, value in zip(iv.interface_names, iv.values):
+                if name == "Goal Current":
+                    self.latest_goal_register[i] = _safe_float(value)
+                    changed = True
+                    break
+        if not changed:
+            return
+        self.latest_goal_ros_s = ros
+        self._mark("goal_register", mono)
+        # Dense CSV: Goal Current callback updates cache/rate only; feedback rows serialize it.
+
+    def _feedback_cb(self, msg: JointState):
+        mono, wall, ros = self._base_times()
+        positions = [float("nan")] * self.n
+        velocities = [float("nan")] * self.n
+        currents = [float("nan")] * self.n
+        index = {name: i for i, name in enumerate(msg.name)}
+        for j, name in enumerate(self.joints):
+            k = index.get(name)
+            if k is None:
+                continue
+            if k < len(msg.position): positions[j] = _safe_float(msg.position[k])
+            if k < len(msg.velocity): velocities[j] = _safe_float(msg.velocity[k])
+            if k < len(msg.effort): currents[j] = _safe_float(msg.effort[k])
+        self._mark("feedback", mono)
+        self._write_row("feedback", mono, wall, ros, _joint_stamp_s(msg), positions, velocities, currents)
+
+    def _rate(self, kind: str) -> Optional[float]:
+        n = self.counts[kind]
+        a, b = self.first_mono[kind], self.last_mono[kind]
+        if n < 2 or a is None or b is None or b <= a:
+            return None
+        return (n - 1) / ((b - a) * 1e-9)
+
+    def close(self):
+        if not self.csv_handle.closed:
+            self.csv_handle.flush()
+            if self.args.fsync_on_close:
+                os.fsync(self.csv_handle.fileno())
+            self.csv_handle.close()
+        self.metadata.update({
+            "closed_wall_time_s": time.time(),
+            "rows": self.counts,
+            "measured_feedback_rate_hz": self._rate("feedback"),
+            "measured_pre_safety_request_rate_hz": self._rate("request"),
+            "measured_goal_register_readback_rate_hz": self._rate("goal_register"),
+            "goal_register_observed": self.counts["goal_register"] > 0,
+        })
+        self._write_metadata()
+        print(f"[INFO] Stopped: {self.counts}, file={self.output}", flush=True)
+        if self.counts["goal_register"] == 0:
+            print(
+                "[ERROR] No Goal Current state samples observed. "
+                "Verify the four Xacro state-interface additions and "
+                "/robot1/dynamic_joint_states.",
+                flush=True,
+            )
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Log OMX Present Current and Goal Current readback without C++ edits")
+    p.add_argument("--namespace", default="robot1")
+    p.add_argument("--joint-states-topic", default=None)
+    p.add_argument("--request-topic", default=None)
+    p.add_argument("--dynamic-joint-states-topic", default=None)
+    p.add_argument("--joints", nargs="+", default=["joint1", "joint2", "joint3", "joint4"])
+    p.add_argument("--dxl-resources", nargs="+", default=["dxl1", "dxl2", "dxl3", "dxl4"])
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--current-a-per-raw", type=float, default=XM430_CURRENT_A_PER_RAW)
+    p.add_argument("--torque-scale-raw-per-nm", type=float, default=180.0)
+    p.add_argument("--torque-slope-nm-per-a", default=None)
+    p.add_argument("--torque-offset-nm", default=None)
+    p.add_argument("--qos-depth", type=int, default=200)
+    p.add_argument("--flush-every", type=int, default=100)
+    p.add_argument("--no-fsync-on-close", dest="fsync_on_close", action="store_false")
+    p.set_defaults(fsync_on_close=True)
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    rclpy.init(args=[])
+    node = None
+    try:
+        node = Logger(args)
+        while rclpy.ok() and not STOP_REQUESTED:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        return 0
+    except (KeyboardInterrupt, ExternalShutdownException):
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] {type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        if node is not None:
+            node.close()
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
